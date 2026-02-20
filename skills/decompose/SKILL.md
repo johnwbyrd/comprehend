@@ -3,422 +3,268 @@ name: decompose
 description: This skill should be used when the user asks to "analyze a large file", "process multiple files", "decompose this problem", "chunk and analyze", "fan out analysis", "recursive analysis", "analyze this codebase", or when the task involves processing context that exceeds what can be reasoned about in a single pass. Also activate when encountering any input larger than ~50KB that requires detailed analysis, or when the user mentions "context decomposition" or "recursive decomposition".
 license: AGPL-3.0
 metadata:
-  version: "0.3.0"
+  version: "0.5.0"
 ---
 
-# Context Decomposition
+# Decompose
 
-Systematic context-first decomposition for large or complex analysis tasks.
+Break large problems into pieces. Use a persistent REPL to store everything
+you learn. Fan out subagents to do the reading. Keep your own context window
+small.
 
-The core principle: **assess context properties first, then write a programmatic
-decomposition strategy based on what the assessment reveals.** Do not attempt to
-process large contexts in a single pass. Do not decompose ad hoc. Measure first,
-then choose the right strategy.
+That is the entire method. What follows is how to do it.
 
-## The Persistent REPL: Your Primary Tool
+## The REPL
 
-**The persistent REPL is the central mechanism for all decomposition work.**
-Do not treat it as optional. Start it first, use it for everything, and keep
-it running throughout the session.
-
-The Bash tool is stateless — each invocation starts a fresh shell. The REPL
-solves this: variables, imports, and function definitions persist across calls.
-This makes it the right tool for:
-
-- **Querying the codebase** — Write short Python programs that grep, find,
-  parse, and extract information. This is preferred over using Read, Grep, or
-  Glob tools directly, because results stay in REPL variables for later use.
-- **Storing discovered context** — Every fact you learn goes into a variable.
-  File listings, function signatures, dependency graphs, summaries — all
-  stored in the REPL namespace where they accumulate instead of evaporating.
-- **Communicating between subagents and parent** — Subagents write results
-  into the REPL. The parent reads them out. No context window wasted on
-  passing large strings back and forth.
-- **Aggregating results** — Fan out subagents, each stores its findings in
-  the REPL, then synthesize from the accumulated state.
-
-**When in doubt: use the REPL.**
-
-### Starting the Server
-
-Start the REPL as your **first action** in any decomposition workflow:
+Every decomposition session starts the same way:
 
 ```bash
 python3 scripts/repl_server.py /tmp/repl.sock &
 ```
 
-This starts a background Python REPL listening on a Unix domain socket. The
-namespace persists across all calls for the lifetime of the session.
-
-### Executing Code
+This launches a persistent Python REPL. Variables, imports, and definitions
+survive across calls. The REPL is your memory — use it instead of reading
+files into your context window.
 
 ```bash
-# Inline code
-python3 scripts/repl_client.py /tmp/repl.sock 'x = 42'
-python3 scripts/repl_client.py /tmp/repl.sock 'print(x + 1)'
+# Run code (state persists between calls)
+python3 scripts/repl_client.py /tmp/repl.sock 'greeting_message = "hello"'
+python3 scripts/repl_client.py /tmp/repl.sock 'print(greeting_message)'
 
-# Pipe code from stdin
-echo 'import math; print(math.sqrt(x))' | python3 scripts/repl_client.py /tmp/repl.sock
-
-# Inspect current variables
+# See all stored variables
 python3 scripts/repl_client.py /tmp/repl.sock --vars
-
-# Shut down the server (only at end of session)
-python3 scripts/repl_client.py /tmp/repl.sock --shutdown
 ```
 
-### REPL-First Patterns
-
-Instead of using file-reading and search tools, write short programs in the
-REPL. The results stay available for the rest of the session.
-
-**Finding files** (instead of Glob):
+**Use the REPL for everything.** Finding files, searching content, reading
+source, storing results — all of it. Every fact you discover goes into a
+variable where it accumulates instead of evaporating.
 
 ```bash
 python3 scripts/repl_client.py /tmp/repl.sock '
-import glob
-source_files = glob.glob("/path/to/project/**/*.py", recursive=True)
-print(f"Found {len(source_files)} files")
-for f in source_files[:10]: print(f)
+import glob, os, re
+
+# Find files (instead of Glob tool)
+project_source_files = glob.glob("/path/to/project/**/*.py", recursive=True)
+project_source_files = [f for f in project_source_files if "/.git/" not in f]
+
+# Measure them (instead of wc)
+file_size_by_path = {f: os.path.getsize(f) for f in project_source_files}
+total_source_bytes = sum(file_size_by_path.values())
+
+# Search content (instead of Grep tool)
+function_definition_matches = {}
+for filepath in project_source_files:
+    with open(filepath) as fh:
+        for line_number, line_text in enumerate(fh, 1):
+            if re.search(r"def process_", line_text):
+                function_definition_matches.setdefault(filepath, []).append(
+                    (line_number, line_text.strip()))
+
+# Everything persists: project_source_files, file_size_by_path,
+# total_source_bytes, function_definition_matches
+print(f"{len(project_source_files)} files, {total_source_bytes/1024:.0f} KB, "
+      f"{len(function_definition_matches)} files with matches")
 '
 ```
 
-**Searching content** (instead of Grep):
+## The Results Dict
+
+All subagent findings go into one well-known dict: **`_decompose_results`**.
+
+Initialize it once at the start of every decomposition session, right after
+starting the REPL:
 
 ```bash
-python3 scripts/repl_client.py /tmp/repl.sock '
-import re
-matches = {}
-for f in source_files:
-    with open(f) as fh:
-        for i, line in enumerate(fh, 1):
-            if re.search(r"def process_", line):
-                matches.setdefault(f, []).append((i, line.strip()))
-print(f"Found matches in {len(matches)} files")
-for f, hits in matches.items():
-    print(f"\n{f}:")
-    for lineno, text in hits: print(f"  {lineno}: {text}")
-'
+python3 scripts/repl_client.py /tmp/repl.sock '_decompose_results = {}'
 ```
 
-**Reading and storing file contents** (instead of Read):
+Every subagent writes to `_decompose_results[key]`. Every parent reads from
+`_decompose_results[key]`. The underscore prefix and specific name avoid
+collisions with any user or project variables.
 
-```bash
-python3 scripts/repl_client.py /tmp/repl.sock '
-file_contents = {}
-for f in source_files:
-    with open(f) as fh:
-        file_contents[f] = fh.read()
-total_bytes = sum(len(v) for v in file_contents.values())
-print(f"Loaded {len(file_contents)} files, {total_bytes} bytes total")
-'
-```
+Keys should be descriptive: `'auth_module_function_signatures'`, not `'chunk1'`.
 
-**Building and querying a knowledge store**:
+## The Workflow
 
-```bash
-python3 scripts/repl_client.py /tmp/repl.sock '
-# Subagent 1 stored its findings:
-analysis = {
-    "core_modules": ["auth.py", "api.py", "models.py"],
-    "entry_points": {"api.py": ["handle_request", "validate_token"]},
-    "dependencies": {"auth.py": ["models.py"], "api.py": ["auth.py", "models.py"]},
-}
-print("Analysis stored for later queries")
-'
-```
+### 1. Measure
 
-The key insight: every subagent and every step of the workflow should read
-from and write to the REPL. Information compounds instead of being lost.
-
-### Variable Naming Convention
-
-When fanning out to subagents, you must establish a naming contract so the
-parent context knows exactly which REPL variables to read back:
-
-1. **Before fan-out**, initialize the collection variable in the REPL:
-   ```bash
-   python3 scripts/repl_client.py /tmp/repl.sock 'results = {}'
-   ```
-
-2. **In each subagent prompt**, specify the exact variable and key to write:
-   ```
-   Task(prompt="...Store your findings in results['handlers'] as a dict...")
-   ```
-
-3. **After fan-out**, the parent reads back by name:
-   ```bash
-   python3 scripts/repl_client.py /tmp/repl.sock '
-   for key, value in results.items():
-       print(f"\n=== {key} ===")
-       print(value)
-   '
-   ```
-
-Use descriptive key names (`results['auth_module']`, `results['chunk_003']`)
-so the parent can selectively read specific results. Always `print()` what
-you need — the REPL client returns stdout to the agent's context.
-
-## Context Assessment Protocol
-
-**MANDATORY GATE: You MUST complete the assessment and announce your strategy
-to the user BEFORE reading any source files.** Do not read files first and
-rationalize a strategy afterward. The assessment controls what you do next.
-
-### Step 1: Start the REPL and measure EVERYTHING
-
-Start the REPL, then use it to identify and measure all files relevant to
-the analysis:
-
-```bash
-python3 scripts/repl_server.py /tmp/repl.sock &
-
-python3 scripts/repl_client.py /tmp/repl.sock '
-import glob, os
-
-# Discover project structure — adapt extensions to the actual project
-all_files = []
-for ext in ["*.py", "*.toml", "*.md", "*.yml", "*.yaml"]:
-    all_files.extend(glob.glob("/path/to/project/**/" + ext, recursive=True))
-
-# Filter out build artifacts
-all_files = [f for f in all_files if "/build/" not in f and "/.git/" not in f]
-
-# Measure
-file_sizes = {f: os.path.getsize(f) for f in all_files}
-total = sum(file_sizes.values())
-print(f"Files: {len(all_files)}, Total: {total} bytes ({total/1024:.1f} KB)")
-for f, s in sorted(file_sizes.items(), key=lambda x: -x[1])[:15]:
-    print(f"  {s:>8} {f}")
-'
-```
-
-For individual large files, also use the bundled chunking script:
+Before reading any files, measure everything you intend to read. Use the
+REPL (as above) or the bundled script:
 
 ```bash
 python3 scripts/chunk_text.py info <file>
 ```
 
-### Step 2: Choose a strategy from the decision table
+Measure ALL files — source, tests, docs, config. The most common failure
+is measuring only the core source, classifying it as small, then also
+reading tests and docs and blowing past the limit.
 
-| Context Size | Context Type | Strategy |
-|:-------------|:-------------|:---------|
-| < 50KB | Any | Direct processing. Read into REPL variables. |
-| 50KB-200KB | Single file | Chunk into sections, process sequentially or in parallel via subagents. |
-| 50KB-200KB | Multi-file | One subagent per file or file group, parallel. All results stored in REPL. |
-| 200KB-1MB | Any | Chunk + fan out parallel subagent calls + aggregate via REPL. |
-| > 1MB | Any | Two-level: chunk, fan out, aggregate chunk answers in REPL, then synthesize. |
+### 2. Choose a strategy
 
-### Step 3: Announce your strategy to the user
+| Total Size | Strategy |
+|:-----------|:---------|
+| < 50KB | Read directly into REPL variables. No subagents needed. |
+| 50KB–200KB | Fan out subagents — one per file or file group, parallel. |
+| 200KB–1MB | Chunk + fan out + aggregate in REPL. |
+| > 1MB | Two-level: chunk, fan out, aggregate chunks, synthesize. |
 
-**Before reading any files,** output a message to the user stating:
+### 3. Announce
 
-1. Total size measured (bytes or KB)
-2. Number of files
-3. Strategy chosen from the table
-4. How you will partition the work (which subagents, what each covers)
+Tell the user what you found and what you plan to do. Example:
 
-Example:
+> 47 files, ~145KB total. Fanning out 4 parallel subagents: (1) core library,
+> (2) test harness, (3) test cases, (4) docs + config. All results stored in
+> `_decompose_results`.
 
-> Assessment: 47 files, ~145KB total. Strategy: multi-file 50KB-200KB —
-> fanning out 4 parallel subagents: (1) core library headers, (2) test
-> harness + adapters, (3) test cases, (4) docs + build config. All results
-> stored in REPL for aggregation.
+Do not read any files before this step.
 
-Only after announcing the strategy may you proceed to execute it.
+### 4. Execute
 
-### Hard limit: 50KB in main context
+Fan out subagents. Each writes to `_decompose_results[key]`. You read the
+results back. Details are in the next section.
 
-**NEVER read more than 50KB of source content directly into the main context.**
-If the assessment shows >50KB total, you MUST use subagents for the excess.
-Subagents digest files and store results in the REPL; the main context stays
-lean for follow-up work.
+### 5. Iterate
 
-If you find yourself making a third or fourth round of parallel Read calls,
-STOP. You are almost certainly over budget. Switch to subagents that use the
-REPL.
+If the aggregated answer has gaps, target those specific areas for deeper
+analysis. The REPL still holds everything from the first pass.
 
-### Cumulative tracking
+### The 50KB Rule
 
-Track cumulative bytes read into the main context. If you notice cumulative
-reads approaching 50KB (roughly 15-20 files of typical source code, or
-~1500 lines of dense code), do not read further — delegate remaining files
-to subagents that store their findings in the REPL.
+**Never read more than 50KB of source into your main context window.**
+Everything above that limit must go through subagents that write findings
+to the REPL. The cost of a subagent is latency. The cost of context
+exhaustion is the entire rest of the session.
 
-## Anti-Pattern: The "It'll Probably Fit" Trap
+Watch for the trap: you measure 30KB of core source (under threshold!),
+then also read tests, config, and docs — now you're at 120KB and your
+context window is shot. Measure the total. All of it.
 
-This is the single most common failure mode. It looks like this:
+## Fan-Out Patterns
 
-1. You measure the core source at ~30KB. Under threshold — direct processing!
-2. You read the source files. Simple, fast, no subagent latency.
-3. But the analysis also needs tests... and config... and docs...
-4. Each round of reads is "just a few more files."
-5. You've now read 120KB into context. The analysis is done, but the context
-   window is exhausted. The user asks a follow-up question and you hit
-   compression, losing nuance from the very files you just read.
+All patterns follow the same contract:
 
-**The cost of subagents is latency. The cost of context exhaustion is the
-entire rest of the session.** When in doubt, use subagents writing to the
-REPL. You are optimizing for session durability, not single-response speed.
+1. Parent initializes `_decompose_results` (once per session).
+2. Subagent writes findings to `_decompose_results[descriptive_key]`.
+3. **Subagent reports back** the key it wrote and a summary of what's in it.
+4. Parent reads `_decompose_results[key]` from the REPL.
 
-## Three Decomposition Primitives
+Step 3 is critical. The Task tool returns a text message to the parent —
+that message is the *only* way the parent learns what the subagent stored.
+Every subagent prompt must end with an instruction to report what was written.
 
-### 1. Direct Query
+### Direct Query
 
-For simple, one-shot tasks: extracting a fact from a chunk, summarizing a
-section, classifying content. The subagent's return value is used directly —
-no REPL needed for simple cases.
+For simple one-shot tasks (summarize, classify, extract a fact). The
+subagent's return value is used directly — no REPL variable needed.
 
 ```
-Task(subagent_type="Explore", prompt="Summarize the key functions in this file: <chunk>")
+Task(subagent_type="Explore",
+     prompt="Summarize the key functions in this file: <chunk>")
 ```
 
-Fast, lightweight, no iteration. Use the return value in the parent context.
+### Recursive Query
 
-### 2. Recursive Query
+For sub-problems needing multi-step reasoning or tool access. The subagent
+stores results in `_decompose_results` under a descriptive key.
 
-For sub-problems requiring multi-step reasoning, code execution, or their own
-iterative problem-solving. The subagent uses the shared REPL to store results
-that outlive the subagent itself.
-
-**Parent initializes**, then launches the subagent:
-```bash
-python3 scripts/repl_client.py /tmp/repl.sock 'auth_analysis = {}'
-```
+**Parent launches subagent:**
 ```
 Task(subagent_type="general-purpose",
      prompt="Use the REPL at /tmp/repl.sock. Read and analyze these modules.
-     Store your findings in auth_analysis['functions'] (list of signatures),
-     auth_analysis['dependencies'] (dict of imports), and
-     auth_analysis['issues'] (list of concerns).
-     Files: <file list>")
+     Store your findings in _decompose_results['auth_module_analysis'] as a
+     dict with keys:
+       'function_signatures' — list of all public function signatures
+       'import_dependency_map' — dict mapping each file to its imports
+       'identified_concerns' — list of architectural or correctness issues
+
+     Files: src/auth.py, src/models.py, src/tokens.py
+
+     When done, reply with: the key you wrote to in _decompose_results,
+     what sub-keys you stored, and a one-line summary of each.")
 ```
 
-**Parent reads back** after the subagent completes:
+**Parent receives** a message like: "Wrote to
+`_decompose_results['auth_module_analysis']` with keys:
+'function_signatures' (12 public functions), 'import_dependency_map' (3 files
+mapped), 'identified_concerns' (2 issues: circular import between auth.py and
+models.py, unused import in tokens.py)."
+
+**Parent reads back:**
 ```bash
 python3 scripts/repl_client.py /tmp/repl.sock '
-print("Functions:", auth_analysis.get("functions", []))
-print("Issues:", auth_analysis.get("issues", []))
+auth_data = _decompose_results["auth_module_analysis"]
+print("Functions:", auth_data["function_signatures"])
+print("Concerns:", auth_data["identified_concerns"])
 '
 ```
 
-### 3. Batched Parallel Query
+### Batched Parallel Query
 
-For independent sub-tasks that can run concurrently. Issue multiple Task tool
-calls in a single response message. They run in parallel.
+For independent chunks that can run concurrently. Issue all Task calls in
+a single message.
 
-**Parent initializes the collection variable first:**
-```bash
-python3 scripts/repl_client.py /tmp/repl.sock 'results = {}'
+**Parent launches all subagents at once:**
+```
+Task(prompt="Use REPL at /tmp/repl.sock. Analyze this log segment for errors.
+     Store in _decompose_results['log_segment_hours_00_to_06'] as a dict with
+     keys 'error_summary' and 'critical_error_list'.
+     Segment: <chunk1>
+
+     When done, reply with: the _decompose_results key you wrote,
+     how many errors found, and one sentence summarizing the most severe.")
+
+Task(prompt="Use REPL at /tmp/repl.sock. Analyze this log segment for errors.
+     Store in _decompose_results['log_segment_hours_06_to_12'] as a dict with
+     keys 'error_summary' and 'critical_error_list'.
+     Segment: <chunk2>
+
+     When done, reply with: the _decompose_results key you wrote,
+     how many errors found, and one sentence summarizing the most severe.")
+
+Task(prompt="Use REPL at /tmp/repl.sock. Analyze this log segment for errors.
+     Store in _decompose_results['log_segment_hours_12_to_18'] as a dict with
+     keys 'error_summary' and 'critical_error_list'.
+     Segment: <chunk3>
+
+     When done, reply with: the _decompose_results key you wrote,
+     how many errors found, and one sentence summarizing the most severe.")
 ```
 
-**Then issues all subagent calls in a single message:**
-```
-Task(prompt="Use REPL at /tmp/repl.sock. Analyze chunk 1, store findings in results['chunk_1'] as a dict with keys 'summary' and 'issues': <chunk1>")
-Task(prompt="Use REPL at /tmp/repl.sock. Analyze chunk 2, store findings in results['chunk_2'] as a dict with keys 'summary' and 'issues': <chunk2>")
-Task(prompt="Use REPL at /tmp/repl.sock. Analyze chunk 3, store findings in results['chunk_3'] as a dict with keys 'summary' and 'issues': <chunk3>")
-```
+**Parent receives** three messages confirming what each wrote.
 
 **Parent reads accumulated results:**
 ```bash
 python3 scripts/repl_client.py /tmp/repl.sock '
-print(f"Collected results from {len(results)} chunks")
-all_issues = []
-for chunk_id, data in sorted(results.items()):
-    print(f"\n{chunk_id}: {data[\"summary\"]}")
-    all_issues.extend(data.get("issues", []))
-print(f"\nTotal issues found: {len(all_issues)}")
+for segment_key, segment_data in sorted(_decompose_results.items()):
+    if segment_key.startswith("log_segment_"):
+        print(f"{segment_key}: {segment_data[\"error_summary\"]}")
+        for critical_error in segment_data.get("critical_error_list", []):
+            print(f"  - {critical_error}")
 '
 ```
 
-Each subagent writes to its own key; the parent reads the full dict afterward.
+## Chunking
 
-## The Decomposition Workflow
-
-Follow these steps in order:
-
-1. **Start REPL** — `python3 scripts/repl_server.py /tmp/repl.sock &`
-   This is always the first step. No exceptions.
-
-2. **Assess** — Use the REPL to measure total context size across ALL files
-   you intend to read. Store the file list and sizes in REPL variables.
-
-3. **Announce** — State your strategy to the user: total size, file count,
-   strategy from the table, partition plan. **Do not read any files before
-   this step.**
-
-4. **Chunk** (if needed) — Use `scripts/chunk_text.py chunk <file> --size <chars>`
-   for text files. For structured files (code, markdown), prefer natural boundaries:
-   functions, classes, sections, chapters. Use `scripts/chunk_text.py boundaries <file>`
-   to detect these.
-
-5. **Fan Out** — Issue parallel Task calls, one per chunk or file group. Each
-   subagent uses the shared REPL to store its findings. Keep prompts identical
-   except for the data and the variable name to write to.
-
-6. **Collect** — Read accumulated results from the REPL. All subagent findings
-   are already there in named variables.
-
-7. **Aggregate** — Synthesize results in the REPL. For large result sets, this
-   step may itself require a Task call to summarize.
-
-8. **Iterate** — If the aggregated answer reveals gaps or contradictions, target
-   those specific chunks for deeper analysis. The REPL still holds all prior
-   findings, so you build on what you have instead of starting over.
-
-For detailed worked examples of this workflow, read `references/decomposition-patterns.md`.
-
-## Chunking Helper Script
-
-The `scripts/chunk_text.py` utility provides deterministic chunking without
-reimplementing the logic each time.
-
-**Subcommands:**
-
-- `info <file>` — Print JSON with file size, line count, char count, estimated
-  tokens (chars/4), and suggested chunk count for a 100K-char target.
-
-- `chunk <file> --size <chars> --overlap <chars>` — Split file into chunks.
-  Default size: 100,000 chars. Default overlap: 500 chars. Breaks at natural
-  boundaries (newlines, paragraph breaks) when possible. Outputs JSON array
-  to stdout.
-
-- `boundaries <file>` — Detect natural boundaries (markdown headers, Python
-  `def`/`class`, blank line sequences). Outputs JSON array of boundary locations.
-
-**Example:**
+For large single files, use the bundled script to split at natural boundaries:
 
 ```bash
-python3 scripts/chunk_text.py info large_log.txt
-python3 scripts/chunk_text.py chunk large_log.txt --size 80000 --overlap 200
+python3 scripts/chunk_text.py info large_file.txt      # measure
+python3 scripts/chunk_text.py boundaries source.py      # find split points
+python3 scripts/chunk_text.py chunk large_file.txt --size 80000 --overlap 200  # split
 ```
+
+For structured files (code, markdown), prefer splitting at functions, classes,
+or section headers rather than arbitrary character boundaries.
 
 ## When NOT to Decompose
 
-- **Small contexts (< 50KB total, including ALL files you will read)** —
-  Direct processing is faster and preserves coherence. Decomposition adds
-  latency and loses cross-section context for no benefit. But be honest about
-  the total — if you're reading source AND tests AND docs, sum all of them.
-  Even for small contexts, prefer loading content into the REPL so it persists.
+- **< 50KB total** — Read into REPL variables directly. No subagents needed.
+- **Global questions** — "What is the overall theme?" needs the full picture.
+  Summarize first (in chunks if needed), then analyze the summary whole.
+- **Quick answers** — When speed matters more than thoroughness.
 
-- **Tasks requiring global understanding** — "What is the overall theme?" or
-  "What is the architectural philosophy?" Chunk-level answers lose the forest
-  for the trees. Instead: summarize the full context first (possibly in chunks),
-  then analyze the summary as a whole.
+## References
 
-- **Time-sensitive requests** — When the user needs a quick answer, sequential
-  processing of a manageable context beats the overhead of decomposition.
-
-## Additional Resources
-
-### Reference Files
-
-- **`references/decomposition-patterns.md`** — Five detailed worked examples:
-  large log analysis, multi-file codebase review, long document Q&A, dataset
-  comparison, and multi-step codebase reasoning.
-
-- **`references/mapping-table.md`** — Decomposition primitive to tool mapping
-  with edge cases and fallback patterns.
-
-- **`references/rlm-system-prompt.md`** — Annotated reference for the theoretical
-  foundation of context-first decomposition.
+- `references/decomposition-patterns.md` — Five worked examples.
+- `references/mapping-table.md` — RLM primitive to agent tool mapping.
+- `references/rlm-system-prompt.md` — Theoretical foundation.
