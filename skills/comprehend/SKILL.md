@@ -298,8 +298,8 @@ Task(prompt="Use REPL at REPL_ADDR. Analyze this log segment for errors.
 python3 SCRIPTS/repl_client.py REPL_ADDR '
 for segment_key, segment_data in sorted(_comprehend_results.items()):
     if segment_key.startswith("log_segment_"):
-        print(f"{segment_key}: {segment_data[\"error_summary\"]}")
-        for critical_error in segment_data.get("critical_error_list", []):
+        print(f"{segment_key}: {segment_data['error_summary']}")
+        for critical_error in segment_data.get('critical_error_list', []):
             print(f"  - {critical_error}")
 '
 ```

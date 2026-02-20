@@ -121,7 +121,7 @@ in the REPL for cross-module aggregation.
        items = [f for f in all_findings if f["severity"] == severity]
        print(f"\n{severity.upper()} ({len(items)}):")
        for item in items:
-           print(f"  {item[\"file\"]}:{item[\"line\"]} — {item[\"description\"]}")
+           print(f"  {item['file']}:{item['line']} — {item['description']}")
    '
    ```
 
@@ -302,7 +302,7 @@ Phase 3: Synthesize the trace from REPL state.
    for layer, funcs in arch.items():
        print(f"\n{layer}:")
        for name, info in funcs.items():
-           print(f"  {name}: {info.get(\"summary\", \"\")}")
+           print(f"  {name}: {info.get('summary', '')}")
    '
    ```
 
@@ -321,7 +321,7 @@ Phase 3: Synthesize the trace from REPL state.
    python3 scripts/repl_client.py REPL_ADDR '
    for i, step in enumerate(trace_result, 1):
        checks = ", ".join(step.get("validation_checks", []))
-       print(f"{i}. {step[\"file\"]}:{step[\"function\"]} — {step[\"action\"]}")
+       print(f"{i}. {step['file']}:{step['function']} — {step['action']}")
        if checks: print(f"   Validates: {checks}")
    '
    ```
