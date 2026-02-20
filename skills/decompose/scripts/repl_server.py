@@ -48,10 +48,13 @@ _SAFE_BUILTINS = {
 }
 
 
+_RESERVED_VARS = {"_decompose_results"}
+
+
 class PersistentREPL:
     def __init__(self):
         self.globals = {"__builtins__": _SAFE_BUILTINS.copy(), "__name__": "__main__"}
-        self.user_locals = {}
+        self.user_locals = {"_decompose_results": {}}
         self._lock = threading.Lock()
 
     def execute(self, code):
@@ -65,14 +68,19 @@ class PersistentREPL:
                 combined = {**self.globals, **self.user_locals}
                 exec(code, combined, combined)
                 for key, value in combined.items():
-                    if key not in self.globals and not key.startswith("_"):
+                    if key not in self.globals and (
+                        not key.startswith("_") or key in _RESERVED_VARS
+                    ):
                         self.user_locals[key] = value
             except Exception as e:
                 stderr_buf.write(f"\n{type(e).__name__}: {e}")
             finally:
                 sys.stdout, sys.stderr = old_stdout, old_stderr
 
-        visible_locals = [k for k in self.user_locals if not k.startswith("_")]
+        visible_locals = [
+            k for k in self.user_locals
+            if not k.startswith("_") or k in _RESERVED_VARS
+        ]
         return {
             "stdout": stdout_buf.getvalue(),
             "stderr": stderr_buf.getvalue(),
@@ -109,7 +117,7 @@ def handle_client(conn, repl):
             send_msg(conn, result)
         elif msg.get("command") == "show_vars":
             visible = {k: type(v).__name__ for k, v in repl.user_locals.items()
-                        if not k.startswith("_")}
+                        if not k.startswith("_") or k in _RESERVED_VARS}
             send_msg(conn, {"locals": visible})
         elif msg.get("command") == "shutdown":
             send_msg(conn, {"status": "shutting down"})
